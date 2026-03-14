@@ -142,3 +142,12 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Pipeline output (generated at runtime)
+extracted/
+bin/
+models/
+prompts/saved/
+
+# Python virtualenv
+.venv/

@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Services{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Go Services</h1>
+  <span class="badge">{{ services | length }} service{{ 's' if services | length != 1 }}</span>
+</div>
+
+<form class="search-form" method="get" action="/">
+  <input
+    type="search"
+    name="q"
+    value="{{ q }}"
+    placeholder="Filter services…"
+    autofocus
+  >
+  <button type="submit">Filter</button>
+  {% if q %}<a class="btn-secondary" href="/">Clear</a>{% endif %}
+</form>
+
+{% if not services %}
+  <div class="empty-state">
+    {% if q %}
+      No services match <strong>{{ q }}</strong>.
+    {% else %}
+      No extracted services found. Run the extractor first:<br>
+      <code>python scripts/extract_go.py --config config/config.yaml</code>
+    {% endif %}
+  </div>
+{% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>Service</th>
+        <th>Language</th>
+        <th class="num">Handlers</th>
+        <th class="num">Dependencies</th>
+        <th class="num">DB Tables</th>
+        <th class="num">Log Events</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for name, svc in services.items() | sort %}
+      <tr>
+        <td><a href="/service/{{ svc.name }}">{{ svc.name }}</a></td>
+        <td><span class="lang lang-{{ svc.language }}">{{ svc.language }}</span></td>
+        <td class="num">{{ svc.handlers | length }}</td>
+        <td class="num">{{ svc.external_deps | length }}</td>
+        <td class="num">{{ svc.db_tables_referenced | length }}</td>
+        <td class="num">{{ svc.log_events | length }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}

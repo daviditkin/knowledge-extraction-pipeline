@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %}{{ svc.name }}{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <a class="back-link" href="/">← All services</a>
+  <h1>{{ svc.name }}</h1>
+  <span class="badge lang lang-{{ svc.language }}">{{ svc.language }}</span>
+</div>
+
+<p class="module-path">{{ svc.module_path }}</p>
+
+{# ---- Handlers ---- #}
+<section>
+  <h2>Handlers <span class="count">({{ svc.handlers | length }})</span></h2>
+  {% if svc.handlers %}
+  <table>
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Method</th>
+        <th>Path / Service</th>
+        <th>Request Type</th>
+        <th>Response Type</th>
+        <th>File</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for h in svc.handlers %}
+      <tr>
+        <td>
+          {% if h.http_path %}
+            <span class="tag tag-http">HTTP</span>
+          {% elif h.grpc_service %}
+            <span class="tag tag-grpc">gRPC</span>
+          {% else %}
+            <span class="tag">?</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if h.http_method %}
+            <span class="method method-{{ h.http_method | lower }}">{{ h.http_method }}</span>
+          {% endif %}
+        </td>
+        <td class="mono">
+          {% if h.http_path %}{{ h.http_path }}
+          {% elif h.grpc_service %}{{ h.grpc_service }}{% if h.grpc_method %}/{{ h.grpc_method }}{% endif %}
+          {% else %}—{% endif %}
+        </td>
+        <td class="mono">{{ h.request_type or '—' }}</td>
+        <td class="mono">{{ h.response_type or '—' }}</td>
+        <td class="mono small">
+          {% if h.file %}{{ h.file }}{% if h.line_start %}:{{ h.line_start }}{% endif %}{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No handlers detected.</p>
+  {% endif %}
+</section>
+
+{# ---- Dependencies ---- #}
+<section>
+  <h2>Dependencies <span class="count">({{ deps | length }})</span></h2>
+  {% if deps %}
+  <ul class="dep-list">
+    {% for dep in deps %}
+    <li>
+      {% if dep.known %}
+        <a href="/service/{{ dep.name }}">{{ dep.name }}</a>
+      {% else %}
+        <span class="dep-unknown" title="Not in extracted services">{{ dep.name }}</span>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No external service dependencies detected.</p>
+  {% endif %}
+</section>
+
+{# ---- DB Tables ---- #}
+<section>
+  <h2>DB Tables Referenced <span class="count">({{ svc.db_tables_referenced | length }})</span></h2>
+  {% if svc.db_tables_referenced %}
+  <ul class="tag-list">
+    {% for table in svc.db_tables_referenced %}
+    <li><span class="tag tag-table">{{ table }}</span></li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No database tables detected.</p>
+  {% endif %}
+</section>
+
+{# ---- Log Events ---- #}
+<section>
+  <h2>Log Events <span class="count">({{ svc.log_events | length }})</span></h2>
+  {% if svc.log_events %}
+  <table>
+    <thead>
+      <tr>
+        <th>Level</th>
+        <th>Message Template</th>
+        <th>Fields</th>
+        <th>File</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for ev in svc.log_events %}
+      <tr>
+        <td><span class="level level-{{ ev.level | lower }}">{{ ev.level }}</span></td>
+        <td class="mono">{{ ev.message_template }}</td>
+        <td class="mono small">{{ ev.fields | join(', ') or '—' }}</td>
+        <td class="mono small">{{ ev.file }}:{{ ev.line }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No log events detected.</p>
+  {% endif %}
+</section>
+{% endblock %}

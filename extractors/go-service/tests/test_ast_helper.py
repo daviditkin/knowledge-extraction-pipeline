@@ -399,7 +399,8 @@ class TestFunctionScoping:
     def test_enroll_handler_calls_sendToStore(self):
         result = _run(self.SOURCE)
         enroll = next(f for f in result["functions"] if f["name"] == "EnrollHandler")
-        assert "sendToStore" in enroll["calls"]
+        callees = {e["callee"] for e in enroll["call_edges"]}
+        assert "sendToStore" in callees
 
     def test_setup_routes_does_not_have_http_client_calls(self):
         result = _run(self.SOURCE)
@@ -409,7 +410,7 @@ class TestFunctionScoping:
     def test_function_fields_never_null(self):
         result = _run(self.SOURCE)
         for f in result["functions"]:
-            assert f["calls"] is not None
+            assert f["call_edges"] is not None
             assert f["http_client_calls"] is not None
             assert f["client_lib_calls"] is not None
 
@@ -477,6 +478,40 @@ class TestHTTPClientCallDetection:
         # but the method arg is still captured
         assert hc["method_arg"] == "GET"
 
+    def test_pattern1_fmt_sprintf_url_resolved(self):
+        """Pattern 1: URL assigned via fmt.Sprintf is resolved through varMap."""
+        source = textwrap.dedent("""\
+            package main
+            import (
+                "fmt"
+                "net/http"
+            )
+            func makeCall() {
+                theurl := fmt.Sprintf("http://svc/api/v1/enroll")
+                http.NewRequest("POST", theurl, nil)
+            }
+        """)
+        result = _run(source)
+        f = next(f for f in result["functions"] if f["name"] == "makeCall")
+        assert len(f["http_client_calls"]) == 1
+        hc = f["http_client_calls"][0]
+        assert "http://svc/api/v1/enroll" in hc["string_args"]
+
+    def test_pattern1_string_literal_var_resolved(self):
+        """Pattern 1: URL assigned from a plain string literal is resolved."""
+        source = textwrap.dedent("""\
+            package main
+            import "net/http"
+            func makeCall() {
+                theurl := "http://svc/api/v1/verify"
+                http.NewRequest("GET", theurl, nil)
+            }
+        """)
+        result = _run(source)
+        f = next(f for f in result["functions"] if f["name"] == "makeCall")
+        hc = f["http_client_calls"][0]
+        assert "http://svc/api/v1/verify" in hc["string_args"]
+
     def test_non_http_calls_not_detected_as_http_client(self):
         source = textwrap.dedent("""\
             package main
@@ -518,10 +553,11 @@ class TestClientLibCallDetection:
         assert "mcbsClient" in receivers
         assert "identityClient" in receivers
 
-    def test_plain_helper_call_in_calls_not_client_lib(self):
+    def test_plain_helper_call_in_call_edges_not_client_lib(self):
         result = _run(self.SOURCE)
         f = next(f for f in result["functions"] if f["name"] == "EnrollHandler")
-        assert "helper" in f["calls"]
+        callees = {e["callee"] for e in f["call_edges"]}
+        assert "helper" in callees
         cl_methods = {c["method"] for c in f["client_lib_calls"]}
         assert "helper" not in cl_methods
 
@@ -575,15 +611,17 @@ class TestCallGraphEdges:
     def test_handler_calls_captured(self):
         result = _run(self.SOURCE)
         h = next(f for f in result["functions"] if f["name"] == "Handler")
-        assert "buildRequest" in h["calls"]
-        assert "validateInput" in h["calls"]
+        callees = {e["callee"] for e in h["call_edges"]}
+        assert "buildRequest" in callees
+        assert "validateInput" in callees
 
     def test_build_request_calls_captured(self):
         result = _run(self.SOURCE)
         b = next(f for f in result["functions"] if f["name"] == "buildRequest")
-        assert "sendHTTP" in b["calls"]
+        callees = {e["callee"] for e in b["call_edges"]}
+        assert "sendHTTP" in callees
 
-    def test_calls_does_not_include_http_client_calls(self):
+    def test_call_edges_does_not_include_http_client_calls(self):
         source = textwrap.dedent("""\
             package main
             import "net/http"
@@ -593,6 +631,24 @@ class TestCallGraphEdges:
         """)
         result = _run(source)
         f = next(f for f in result["functions"] if f["name"] == "send")
-        # http.NewRequest should be in http_client_calls, not also in calls
-        assert "http.NewRequest" not in f["calls"]
+        # http.NewRequest should be in http_client_calls, not also in call_edges
+        callees = {e["callee"] for e in f["call_edges"]}
+        assert "http.NewRequest" not in callees
         assert len(f["http_client_calls"]) == 1
+
+    def test_call_edge_carries_call_site_string_args(self):
+        """Pattern 2: string args at the call site are captured on the call edge."""
+        source = textwrap.dedent("""\
+            package main
+            import "net/http"
+            func Handler() {
+                doRequest("POST", "http://svc/api/v1/enroll")
+            }
+            func doRequest(method string, url string) {
+                http.NewRequest(method, url, nil)
+            }
+        """)
+        result = _run(source)
+        handler = next(f for f in result["functions"] if f["name"] == "Handler")
+        edge = next(e for e in handler["call_edges"] if e["callee"] == "doRequest")
+        assert "http://svc/api/v1/enroll" in edge["string_args"]

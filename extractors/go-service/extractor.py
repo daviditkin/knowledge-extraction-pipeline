@@ -226,13 +226,19 @@ class GoServiceExtractor:
         max_depth: int = 5,
     ) -> list[OutboundCall]:
         """BFS from handler_func through the intra-service call graph,
-        collecting all reachable HTTP client calls and client lib calls."""
+        collecting all reachable HTTP client calls and client lib calls.
+
+        Each queue entry carries site_strings — the string literals that were
+        passed at the call site leading to this function. These supplement the
+        function's own http_client_call string_args, handling Pattern 2 where
+        the URL is built at the call site and passed as a parameter."""
         visited: set[str] = set()
-        queue: deque[tuple[str, list[str]]] = deque([(handler_func, [])])
+        # (func_name, via, site_strings)
+        queue: deque[tuple[str, list[str], list[str]]] = deque([(handler_func, [], [])])
         result: list[OutboundCall] = []
 
         while queue:
-            func_name, via = queue.popleft()
+            func_name, via, site_strings = queue.popleft()
             if func_name in visited or len(via) > max_depth:
                 continue
             visited.add(func_name)
@@ -241,7 +247,9 @@ class GoServiceExtractor:
                 continue
 
             for hc in func.get("http_client_calls") or []:
-                string_args = hc.get("string_args") or []
+                # Merge the call's own string_args with strings from the call site.
+                # This resolves Pattern 2: the URL was passed in from the caller.
+                string_args = (hc.get("string_args") or []) + site_strings
                 path = self._extract_path_literal(string_args)
                 result.append(OutboundCall(
                     call_type="http",
@@ -264,11 +272,12 @@ class GoServiceExtractor:
                     file=handler_file,
                 ))
 
-            # Follow intra-service call edges
-            for callee in func.get("calls") or []:
-                # "receiver.Method" → try just the method name for local lookups
+            # Follow intra-service call edges, carrying the call-site string args.
+            for edge in func.get("call_edges") or []:
+                callee = edge.get("callee", "") if isinstance(edge, dict) else edge
+                edge_strings = (edge.get("string_args") or []) if isinstance(edge, dict) else []
                 simple = callee.split(".")[-1] if "." in callee else callee
-                queue.append((simple, via + [func_name]))
+                queue.append((simple, via + [func_name], edge_strings))
 
         return result
 
@@ -283,32 +292,38 @@ class GoServiceExtractor:
             if not func_name or not func_name[0].isupper():
                 continue  # skip unexported functions
 
-            # Mini BFS to collect reachable http_client_calls
+            # Mini BFS to collect reachable http_client_calls with call-site strings.
             visited: set[str] = set()
-            q: deque[tuple[str, int]] = deque([(func_name, 0)])
-            http_calls: list[dict] = []
+            q: deque[tuple[str, int, list[str]]] = deque([(func_name, 0, [])])
+            # (call dict, site_strings from caller)
+            http_calls: list[tuple[dict, list[str]]] = []
             while q:
-                name, depth = q.popleft()
+                name, depth, site_strings = q.popleft()
                 if name in visited or depth > 3:
                     continue
                 visited.add(name)
                 f = func_index.get(name)
                 if f is None:
                     continue
-                http_calls.extend(f.get("http_client_calls") or [])
-                for callee in f.get("calls") or []:
+                for hc in f.get("http_client_calls") or []:
+                    http_calls.append((hc, site_strings))
+                for edge in f.get("call_edges") or []:
+                    callee = edge.get("callee", "") if isinstance(edge, dict) else edge
+                    edge_strings = (edge.get("string_args") or []) if isinstance(edge, dict) else []
                     simple = callee.split(".")[-1] if "." in callee else callee
-                    q.append((simple, depth + 1))
+                    q.append((simple, depth + 1, edge_strings))
 
             if not http_calls:
                 continue
 
             all_string_args = [
-                arg for hc in http_calls for arg in (hc.get("string_args") or [])
+                arg
+                for hc, site_strings in http_calls
+                for arg in (hc.get("string_args") or []) + site_strings
             ]
             path = self._extract_path_literal(all_string_args)
             method = next(
-                (hc.get("method_arg") for hc in http_calls if hc.get("method_arg")),
+                (hc.get("method_arg") for hc, _ in http_calls if hc.get("method_arg")),
                 None,
             )
             result.append(ClientFunction(
@@ -356,9 +371,16 @@ class GoServiceExtractor:
 
     @staticmethod
     def _extract_path_literal(string_args: list[str]) -> str | None:
-        """Return the first string arg that looks like a URL path (starts with /)."""
+        """Return the first string arg that looks like a URL or path.
+
+        Accepts both path-only strings ("/api/v1/enroll") and full URLs
+        ("http://svc/api/v1/enroll" or fmt.Sprintf format strings like
+        "http://svc/%s/enroll"). Full URLs are returned as-is so callers
+        can see the target service name in the host portion."""
         for arg in string_args:
             if arg.startswith("/"):
+                return arg
+            if "://" in arg:
                 return arg
         return None
 

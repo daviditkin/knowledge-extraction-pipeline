@@ -27,16 +27,26 @@ type FileResult struct {
 	DBCalls           []DBCall           `json:"db_calls"`
 }
 
+// CallEdge represents one intra-service call edge. StringArgs holds the
+// string literals passed at the call site — used in the Python extractor
+// to resolve URL arguments when the callee receives the URL as a function
+// parameter (Pattern 2: url built at call site, passed into helper).
+type CallEdge struct {
+	Callee     string   `json:"callee"`
+	StringArgs []string `json:"string_args"`
+	Line       int      `json:"line"`
+}
+
 // FunctionInfo describes one function's outbound call behaviour.
-// Calls contains every call edge for the intra-service call graph
-// (plain "funcName" or "receiver.Method"). HTTPClientCalls and
-// ClientLibCalls are the categorised subsets the Python extractor
-// needs for call-chain resolution.
+// CallEdges contains every call edge for the intra-service call graph
+// (plain "funcName" or "receiver.Method"), with the string literals
+// passed at the call site. HTTPClientCalls and ClientLibCalls are the
+// categorised subsets the Python extractor needs for call-chain resolution.
 type FunctionInfo struct {
 	Name            string           `json:"name"`
 	StartLine       int              `json:"start_line"`
 	EndLine         int              `json:"end_line"`
-	Calls           []string         `json:"calls"`            // all call edges
+	CallEdges       []CallEdge       `json:"call_edges"`        // all call edges with call-site string args
 	HTTPClientCalls []HTTPClientCall `json:"http_client_calls"` // direct net/http client calls
 	ClientLibCalls  []ClientLibCall  `json:"client_lib_calls"`  // calls on *Client receivers
 }
@@ -45,7 +55,7 @@ type FunctionInfo struct {
 type HTTPClientCall struct {
 	Func       string   `json:"func"`        // e.g. "http.NewRequest", "http.Get"
 	MethodArg  string   `json:"method_arg"`  // "GET"/"POST" if first arg is a string literal
-	StringArgs []string `json:"string_args"` // all string literal args in the call
+	StringArgs []string `json:"string_args"` // string literal args, with local vars resolved
 	Line       int      `json:"line"`
 }
 
@@ -55,7 +65,7 @@ type HTTPClientCall struct {
 type ClientLibCall struct {
 	Receiver   string   `json:"receiver"`    // variable name, e.g. "mcbsClient"
 	Method     string   `json:"method"`      // e.g. "StoreTemplate"
-	StringArgs []string `json:"string_args"` // all string literal args
+	StringArgs []string `json:"string_args"` // string literal args
 	Line       int      `json:"line"`
 }
 
@@ -179,7 +189,7 @@ func extractFunction(fset *token.FileSet, d *ast.FuncDecl) (
 		Name:            d.Name.Name,
 		StartLine:       fset.Position(d.Pos()).Line,
 		EndLine:         fset.Position(d.End()).Line,
-		Calls:           []string{},
+		CallEdges:       []CallEdge{},
 		HTTPClientCalls: []HTTPClientCall{},
 		ClientLibCalls:  []ClientLibCall{},
 	}
@@ -192,6 +202,11 @@ func extractFunction(fset *token.FileSet, d *ast.FuncDecl) (
 		return
 	}
 
+	// Pre-pass: collect local variable → string value assignments so we can
+	// resolve variable arguments in HTTP client calls (Pattern 1:
+	// theurl := fmt.Sprintf("http://svc/path") … http.NewRequest("POST", theurl, …)).
+	varMap := collectVarAssignments(d.Body)
+
 	ast.Inspect(d.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
@@ -200,9 +215,13 @@ func extractFunction(fset *token.FileSet, d *ast.FuncDecl) (
 
 		line := fset.Position(call.Pos()).Line
 
-		// Plain function call (no receiver): add to call graph.
+		// Plain function call (no receiver): add to call graph with call-site strings.
 		if ident, ok := call.Fun.(*ast.Ident); ok {
-			fi.Calls = append(fi.Calls, ident.Name)
+			fi.CallEdges = append(fi.CallEdges, CallEdge{
+				Callee:     ident.Name,
+				StringArgs: extractStringLiteralsResolved(call.Args, varMap),
+				Line:       line,
+			})
 			return true
 		}
 
@@ -253,7 +272,7 @@ func extractFunction(fset *token.FileSet, d *ast.FuncDecl) (
 		}
 
 		// 5. Direct HTTP client calls (net/http package or http-named clients)
-		if hc, ok := tryHTTPClientCall(call, funcName, receiverName, line); ok {
+		if hc, ok := tryHTTPClientCall(call, funcName, receiverName, line, varMap); ok {
 			fi.HTTPClientCalls = append(fi.HTTPClientCalls, hc)
 			return true
 		}
@@ -263,14 +282,18 @@ func extractFunction(fset *token.FileSet, d *ast.FuncDecl) (
 			fi.ClientLibCalls = append(fi.ClientLibCalls, ClientLibCall{
 				Receiver:   receiverName,
 				Method:     funcName,
-				StringArgs: extractOnlyStringLiterals(call.Args),
+				StringArgs: extractStringLiteralsResolved(call.Args, varMap),
 				Line:       line,
 			})
 			return true
 		}
 
-		// 7. Everything else → call graph edge
-		fi.Calls = append(fi.Calls, fullName)
+		// 7. Everything else → call graph edge with call-site string args
+		fi.CallEdges = append(fi.CallEdges, CallEdge{
+			Callee:     fullName,
+			StringArgs: extractStringLiteralsResolved(call.Args, varMap),
+			Line:       line,
+		})
 		return true
 	})
 
@@ -278,17 +301,19 @@ func extractFunction(fset *token.FileSet, d *ast.FuncDecl) (
 }
 
 // tryHTTPClientCall detects outbound net/http client calls.
-func tryHTTPClientCall(call *ast.CallExpr, funcName, receiverName string, line int) (HTTPClientCall, bool) {
+// varMap is used to resolve local variable arguments to their string values
+// (Pattern 1: theurl := fmt.Sprintf("http://svc/path") … http.NewRequest(method, theurl, …)).
+func tryHTTPClientCall(call *ast.CallExpr, funcName, receiverName string, line int, varMap map[string]string) (HTTPClientCall, bool) {
 	// http.NewRequest(method, url, body)
 	if receiverName == "http" && funcName == "NewRequest" {
 		methodArg := ""
 		if len(call.Args) >= 1 {
-			methodArg = stringLiteral(call.Args[0])
+			methodArg = stringLiteralResolved(call.Args[0], varMap)
 		}
 		return HTTPClientCall{
 			Func:       "http.NewRequest",
 			MethodArg:  methodArg,
-			StringArgs: extractOnlyStringLiterals(call.Args),
+			StringArgs: extractStringLiteralsResolved(call.Args, varMap),
 			Line:       line,
 		}, true
 	}
@@ -302,7 +327,7 @@ func tryHTTPClientCall(call *ast.CallExpr, funcName, receiverName string, line i
 			return HTTPClientCall{
 				Func:       "http." + funcName,
 				MethodArg:  method,
-				StringArgs: extractOnlyStringLiterals(call.Args),
+				StringArgs: extractStringLiteralsResolved(call.Args, varMap),
 				Line:       line,
 			}, true
 		}
@@ -313,12 +338,86 @@ func tryHTTPClientCall(call *ast.CallExpr, funcName, receiverName string, line i
 		return HTTPClientCall{
 			Func:       receiverName + ".Do",
 			MethodArg:  "",
-			StringArgs: extractOnlyStringLiterals(call.Args),
+			StringArgs: extractStringLiteralsResolved(call.Args, varMap),
 			Line:       line,
 		}, true
 	}
 
 	return HTTPClientCall{}, false
+}
+
+// collectVarAssignments does a single-pass walk of a function body to build
+// a map of varName → string value for simple string assignments:
+//
+//	x := "literal"
+//	x := fmt.Sprintf("format", …)   — records the format string
+//	x = "literal"
+//
+// Only direct string-literal or fmt.Sprintf-format assignments are tracked.
+func collectVarAssignments(body *ast.BlockStmt) map[string]string {
+	m := make(map[string]string)
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch s := n.(type) {
+		case *ast.AssignStmt:
+			for i, lhs := range s.Lhs {
+				ident, ok := lhs.(*ast.Ident)
+				if !ok || i >= len(s.Rhs) {
+					continue
+				}
+				if v := resolveStringExpr(s.Rhs[i]); v != "" {
+					m[ident.Name] = v
+				}
+			}
+		case *ast.DeclStmt:
+			gd, ok := s.Decl.(*ast.GenDecl)
+			if !ok {
+				break
+			}
+			for _, spec := range gd.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for i, name := range vs.Names {
+					if i >= len(vs.Values) {
+						continue
+					}
+					if v := resolveStringExpr(vs.Values[i]); v != "" {
+						m[name.Name] = v
+					}
+				}
+			}
+		}
+		return true
+	})
+	return m
+}
+
+// resolveStringExpr returns the string value if the expression is a string
+// literal or a fmt.Sprintf/fmt.Errorf call whose first argument is a string
+// literal. Returns "" if the expression cannot be resolved.
+func resolveStringExpr(e ast.Expr) string {
+	switch v := e.(type) {
+	case *ast.BasicLit:
+		if v.Kind == token.STRING {
+			return strings.Trim(v.Value, `"`)
+		}
+	case *ast.CallExpr:
+		sel, ok := v.Fun.(*ast.SelectorExpr)
+		if !ok {
+			break
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		if !ok {
+			break
+		}
+		if pkg.Name == "fmt" && (sel.Sel.Name == "Sprintf" || sel.Sel.Name == "Errorf") {
+			if len(v.Args) > 0 {
+				return resolveStringExpr(v.Args[0])
+			}
+		}
+	}
+	return ""
 }
 
 func tryHTTPHandler(call *ast.CallExpr, sel *ast.SelectorExpr, funcName, receiverName string, line int) (HTTPHandler, bool) {
@@ -462,6 +561,36 @@ func extractOnlyStringLiterals(args []ast.Expr) []string {
 		}
 	}
 	return result
+}
+
+// extractStringLiteralsResolved returns string literal values, with variable
+// references resolved through varMap. Used when capturing call-site strings
+// for HTTP calls and call edges.
+func extractStringLiteralsResolved(args []ast.Expr, varMap map[string]string) []string {
+	result := []string{}
+	for _, arg := range args {
+		if v := stringLiteralResolved(arg, varMap); v != "" {
+			result = append(result, v)
+		}
+	}
+	return result
+}
+
+// stringLiteralResolved returns the string value of an expression: either a
+// string literal directly, or a variable that was assigned a string literal
+// (via varMap from collectVarAssignments).
+func stringLiteralResolved(e ast.Expr, varMap map[string]string) string {
+	switch a := e.(type) {
+	case *ast.BasicLit:
+		if a.Kind == token.STRING {
+			return strings.Trim(a.Value, `"`)
+		}
+	case *ast.Ident:
+		if v, ok := varMap[a.Name]; ok {
+			return v
+		}
+	}
+	return ""
 }
 
 func stringLiteral(e ast.Expr) string {

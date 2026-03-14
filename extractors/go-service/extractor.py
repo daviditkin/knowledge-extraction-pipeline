@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
-import subprocess
+from collections import deque
 from pathlib import Path
+import subprocess
 
 try:
     import sqlglot
@@ -14,19 +15,16 @@ except ImportError:
 
 from extractors.shared.config import Config
 from extractors.shared.file_walker import FileWalker
-from extractors.shared.models import HandlerInfo, LogEvent, ServiceDoc
+from extractors.shared.models import (
+    ClientFunction,
+    HandlerInfo,
+    LogEvent,
+    OutboundCall,
+    ServiceDoc,
+)
 from extractors.shared.output_writer import OutputWriter
 
 logger = logging.getLogger(__name__)
-
-# Log method names that indicate a structured log call
-_LOG_METHODS = {"Info", "Warn", "Warning", "Error", "Debug", "Fatal", "AddEvent"}
-
-# DB query methods whose first string arg is SQL
-_DB_METHODS = {
-    "Query", "QueryRow", "QueryContext", "QueryRowContext",
-    "Exec", "ExecContext", "Get", "Select", "NamedQuery", "NamedExec",
-}
 
 
 class GoServiceExtractor:
@@ -63,13 +61,16 @@ class GoServiceExtractor:
                 self.writer.write_service_doc(doc)
                 results.append(doc)
                 logger.info(
-                    "  ✓ %s — %d handlers, %d deps, %d tables, %d log events",
+                    "  \u2713 %s \u2014 %d handlers, %d deps, %d tables, %d log events, %d client funcs",
                     name, len(doc.handlers), len(doc.external_deps),
                     len(doc.db_tables_referenced), len(doc.log_events),
+                    len(doc.client_functions),
                 )
             except Exception:
-                logger.exception("  ✗ %s — extraction failed", name)
+                logger.exception("  \u2717 %s \u2014 extraction failed", name)
 
+        # Second pass: resolve client-library calls across all services
+        self.resolve_client_lib_calls(results, self.writer)
         return results
 
     # ---- service discovery ----
@@ -78,16 +79,12 @@ class GoServiceExtractor:
         source = Path(self.cfg.source_dir)
         services: dict[str, Path] = {}
 
-        # Walk looking for go.mod files first (module roots = one service per module)
         for go_mod in source.rglob("go.mod"):
-            service_dir = go_mod.parent
-            # Skip if inside vendor/
             if "vendor" in go_mod.parts:
                 continue
             name = self._service_name_from_mod(go_mod)
-            services[name] = service_dir
+            services[name] = go_mod.parent
 
-        # Fallback: directories with main.go but no go.mod ancestor already captured
         if not services:
             for main_go in source.rglob("main.go"):
                 if "vendor" in main_go.parts:
@@ -123,12 +120,7 @@ class GoServiceExtractor:
         )
         cache_path = self.extracted_dir / ".hashes" / f"{name}.json"
 
-        if changed_only:
-            go_files = walker.changed_files(cache_path)
-        else:
-            go_files = walker.walk()
-
-        # Read module path from go.mod
+        go_files = walker.changed_files(cache_path) if changed_only else walker.walk()
         module_path = self._read_module_path(service_dir)
 
         handlers: list[HandlerInfo] = []
@@ -136,6 +128,9 @@ class GoServiceExtractor:
         db_queries: list[str] = []
         all_imports: list[str] = []
         file_hash_map: dict[str, str] = {}
+
+        # func name → raw FunctionInfo dict from ast_helper; used for call graph
+        func_index: dict[str, dict] = {}
 
         for go_file in go_files:
             try:
@@ -148,18 +143,17 @@ class GoServiceExtractor:
             file_hash_map[rel] = walker._sha256(go_file)
             all_imports.extend(ast_result.get("imports") or [])
 
+            # Build function index for call graph resolution
+            for fi in ast_result.get("functions") or []:
+                if fi.get("name"):
+                    func_index[fi["name"]] = fi
+
             # HTTP handlers
             for h in ast_result.get("http_handlers") or []:
                 handlers.append(HandlerInfo(
                     name=h.get("handler_func", ""),
                     http_method=h.get("method"),
                     http_path=h.get("pattern"),
-                    grpc_service=None,
-                    grpc_method=None,
-                    request_type=None,
-                    response_type=None,
-                    calls_services=[],
-                    db_queries=[],
                     file=rel,
                     line_start=h.get("registration_line", 0),
                     line_end=h.get("registration_line", 0),
@@ -169,14 +163,7 @@ class GoServiceExtractor:
             for g in ast_result.get("grpc_registrations") or []:
                 handlers.append(HandlerInfo(
                     name=g.get("service_name", ""),
-                    http_method=None,
-                    http_path=None,
                     grpc_service=g.get("service_name"),
-                    grpc_method=None,
-                    request_type=None,
-                    response_type=None,
-                    calls_services=[],
-                    db_queries=[],
                     file=rel,
                     line_start=g.get("registration_line", 0),
                     line_end=g.get("registration_line", 0),
@@ -195,17 +182,23 @@ class GoServiceExtractor:
 
             # DB calls
             for dc in ast_result.get("db_calls") or []:
-                args = dc.get("args", [])
+                args = dc.get("args") or []
                 if args:
                     sql = self._strip_quotes(args[0])
                     if sql:
                         db_queries.append(sql)
 
-        # Deduplicate DB queries and extract table names
+        # Resolve outbound calls per handler using the call graph
+        for handler in handlers:
+            handler.outbound_calls = self._resolve_outbound_calls(
+                handler.name, func_index, handler.file
+            )
+
+        # Build client_functions for library services (e.g. mcbs)
+        client_functions = self._build_client_functions(func_index)
+
         unique_queries = list(dict.fromkeys(db_queries))
         db_tables = self._extract_tables(unique_queries)
-
-        # External service dependencies from imports
         external_deps = self._extract_deps(all_imports)
 
         walker.update_hash_cache(go_files, cache_path)
@@ -219,10 +212,155 @@ class GoServiceExtractor:
             external_deps=sorted(set(external_deps)),
             db_tables_referenced=sorted(set(db_tables)),
             log_events=log_events,
+            client_functions=client_functions,
             file_hash_map=file_hash_map,
         )
 
+    # ---- call graph resolution ----
+
+    def _resolve_outbound_calls(
+        self,
+        handler_func: str,
+        func_index: dict[str, dict],
+        handler_file: str,
+        max_depth: int = 5,
+    ) -> list[OutboundCall]:
+        """BFS from handler_func through the intra-service call graph,
+        collecting all reachable HTTP client calls and client lib calls."""
+        visited: set[str] = set()
+        queue: deque[tuple[str, list[str]]] = deque([(handler_func, [])])
+        result: list[OutboundCall] = []
+
+        while queue:
+            func_name, via = queue.popleft()
+            if func_name in visited or len(via) > max_depth:
+                continue
+            visited.add(func_name)
+            func = func_index.get(func_name)
+            if func is None:
+                continue
+
+            for hc in func.get("http_client_calls") or []:
+                string_args = hc.get("string_args") or []
+                path = self._extract_path_literal(string_args)
+                result.append(OutboundCall(
+                    call_type="http",
+                    via_functions=list(via),
+                    http_method=hc.get("method_arg") or None,
+                    path_literal=path,
+                    resolved=path is not None,
+                    line=hc.get("line", 0),
+                    file=handler_file,
+                ))
+
+            for cl in func.get("client_lib_calls") or []:
+                result.append(OutboundCall(
+                    call_type="client_lib",
+                    via_functions=list(via),
+                    receiver=cl.get("receiver"),
+                    method=cl.get("method"),
+                    resolved=False,
+                    line=cl.get("line", 0),
+                    file=handler_file,
+                ))
+
+            # Follow intra-service call edges
+            for callee in func.get("calls") or []:
+                # "receiver.Method" → try just the method name for local lookups
+                simple = callee.split(".")[-1] if "." in callee else callee
+                queue.append((simple, via + [func_name]))
+
+        return result
+
+    def _build_client_functions(
+        self, func_index: dict[str, dict]
+    ) -> list[ClientFunction]:
+        """For each exported function that has reachable HTTP client calls,
+        emit a ClientFunction entry. Used by other services to resolve their
+        client_lib_calls in the second pass."""
+        result: list[ClientFunction] = []
+        for func_name in func_index:
+            if not func_name or not func_name[0].isupper():
+                continue  # skip unexported functions
+
+            # Mini BFS to collect reachable http_client_calls
+            visited: set[str] = set()
+            q: deque[tuple[str, int]] = deque([(func_name, 0)])
+            http_calls: list[dict] = []
+            while q:
+                name, depth = q.popleft()
+                if name in visited or depth > 3:
+                    continue
+                visited.add(name)
+                f = func_index.get(name)
+                if f is None:
+                    continue
+                http_calls.extend(f.get("http_client_calls") or [])
+                for callee in f.get("calls") or []:
+                    simple = callee.split(".")[-1] if "." in callee else callee
+                    q.append((simple, depth + 1))
+
+            if not http_calls:
+                continue
+
+            all_string_args = [
+                arg for hc in http_calls for arg in (hc.get("string_args") or [])
+            ]
+            path = self._extract_path_literal(all_string_args)
+            method = next(
+                (hc.get("method_arg") for hc in http_calls if hc.get("method_arg")),
+                None,
+            )
+            result.append(ClientFunction(
+                name=func_name,
+                http_method=method,
+                path_literal=path,
+                string_args=all_string_args,
+            ))
+
+        return result
+
+    @staticmethod
+    def resolve_client_lib_calls(
+        docs: list[ServiceDoc],
+        writer: OutputWriter,
+    ) -> None:
+        """Second pass: resolve client_lib OutboundCalls against all services'
+        client_functions. Re-writes any ServiceDoc that gains new resolutions."""
+        # method_name → (service_name, ClientFunction); first occurrence wins
+        method_map: dict[str, tuple[str, ClientFunction]] = {}
+        for doc in docs:
+            for cf in doc.client_functions:
+                if cf.name not in method_map:
+                    method_map[cf.name] = (doc.name, cf)
+
+        if not method_map:
+            return
+
+        for doc in docs:
+            changed = False
+            for handler in doc.handlers:
+                for call in handler.outbound_calls:
+                    if call.call_type == "client_lib" and not call.resolved and call.method:
+                        if call.method in method_map:
+                            svc_name, cf = method_map[call.method]
+                            call.target_service = svc_name
+                            call.target_path = cf.path_literal
+                            call.resolved = True
+                            changed = True
+            if changed:
+                writer.write_service_doc(doc)
+                logger.debug("Re-wrote %s after client-lib resolution", doc.name)
+
     # ---- helpers ----
+
+    @staticmethod
+    def _extract_path_literal(string_args: list[str]) -> str | None:
+        """Return the first string arg that looks like a URL path (starts with /)."""
+        for arg in string_args:
+            if arg.startswith("/"):
+                return arg
+        return None
 
     def _run_ast_helper(self, go_file: Path) -> dict:
         result = subprocess.run(
@@ -248,7 +386,6 @@ class GoServiceExtractor:
         func_name: str = lc.get("func_name", "")
         args: list[str] = lc.get("args", [])
 
-        # Determine level from method name
         level = "INFO"
         for part in ("Error", "Warn", "Warning", "Debug", "Fatal"):
             if part.lower() in func_name.lower():
@@ -257,15 +394,12 @@ class GoServiceExtractor:
 
         message = ""
         fields: list[str] = []
-
         if args:
             message = self._strip_quotes(args[0])
-            # slog-style: "msg", "key1", val1, "key2", val2
-            # String literals in positions 1, 3, 5 ... are field names
             i = 1
             while i < len(args):
                 key = self._strip_quotes(args[i])
-                if key and key.startswith('"') is False and not key.startswith("<"):
+                if key and not key.startswith("<"):
                     fields.append(key)
                 i += 2
 
@@ -286,7 +420,6 @@ class GoServiceExtractor:
         for imp in imports:
             if imp.startswith(prefix):
                 remainder = imp[len(prefix):]
-                # e.g. "enrollment-svc/client" → "enrollment-svc"
                 service_name = remainder.split("/")[0]
                 if service_name:
                     deps.append(service_name)

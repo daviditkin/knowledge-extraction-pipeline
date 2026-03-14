@@ -342,3 +342,257 @@ class TestImports:
         """)
         result = _run(source)
         assert result["imports"] == []
+
+
+# ---- per-function scoping ----
+
+class TestFunctionScoping:
+    """Verify that calls are attributed to their enclosing function, not globally."""
+
+    SOURCE = textwrap.dedent("""\
+        package main
+
+        import (
+            "net/http"
+            "log/slog"
+        )
+
+        func SetupRoutes() {
+            http.HandleFunc("/api/v1/enroll", EnrollHandler)
+            http.HandleFunc("/api/v1/verify", VerifyHandler)
+        }
+
+        func EnrollHandler(w http.ResponseWriter, r *http.Request) {
+            slog.Info("enrolling")
+            sendToStore(r)
+        }
+
+        func VerifyHandler(w http.ResponseWriter, r *http.Request) {
+            slog.Info("verifying")
+        }
+
+        func sendToStore(r *http.Request) {
+            http.NewRequest("POST", "/api/v1/store", nil)
+        }
+    """)
+
+    def test_functions_present(self):
+        result = _run(self.SOURCE)
+        names = {f["name"] for f in result["functions"]}
+        assert "SetupRoutes" in names
+        assert "EnrollHandler" in names
+        assert "VerifyHandler" in names
+        assert "sendToStore" in names
+
+    def test_http_client_call_scoped_to_sendToStore(self):
+        result = _run(self.SOURCE)
+        send = next(f for f in result["functions"] if f["name"] == "sendToStore")
+        assert len(send["http_client_calls"]) == 1
+        assert send["http_client_calls"][0]["func"] == "http.NewRequest"
+        assert send["http_client_calls"][0]["method_arg"] == "POST"
+
+    def test_http_client_call_not_in_enroll_handler(self):
+        result = _run(self.SOURCE)
+        enroll = next(f for f in result["functions"] if f["name"] == "EnrollHandler")
+        assert enroll["http_client_calls"] == []
+
+    def test_enroll_handler_calls_sendToStore(self):
+        result = _run(self.SOURCE)
+        enroll = next(f for f in result["functions"] if f["name"] == "EnrollHandler")
+        assert "sendToStore" in enroll["calls"]
+
+    def test_setup_routes_does_not_have_http_client_calls(self):
+        result = _run(self.SOURCE)
+        setup = next(f for f in result["functions"] if f["name"] == "SetupRoutes")
+        assert setup["http_client_calls"] == []
+
+    def test_function_fields_never_null(self):
+        result = _run(self.SOURCE)
+        for f in result["functions"]:
+            assert f["calls"] is not None
+            assert f["http_client_calls"] is not None
+            assert f["client_lib_calls"] is not None
+
+
+# ---- HTTP client call detection ----
+
+class TestHTTPClientCallDetection:
+
+    def test_http_new_request_detected(self):
+        source = textwrap.dedent("""\
+            package main
+            import "net/http"
+            func makeCall() {
+                http.NewRequest("POST", "/api/v1/enroll", nil)
+            }
+        """)
+        result = _run(source)
+        f = next(f for f in result["functions"] if f["name"] == "makeCall")
+        assert len(f["http_client_calls"]) == 1
+        hc = f["http_client_calls"][0]
+        assert hc["func"] == "http.NewRequest"
+        assert hc["method_arg"] == "POST"
+        assert "/api/v1/enroll" in hc["string_args"]
+
+    def test_http_get_detected(self):
+        source = textwrap.dedent("""\
+            package main
+            import "net/http"
+            func fetch() {
+                http.Get("http://svc/api/v1/status")
+            }
+        """)
+        result = _run(source)
+        f = next(f for f in result["functions"] if f["name"] == "fetch")
+        assert len(f["http_client_calls"]) == 1
+        assert f["http_client_calls"][0]["method_arg"] == "GET"
+
+    def test_http_post_detected(self):
+        source = textwrap.dedent("""\
+            package main
+            import "net/http"
+            func send() {
+                http.Post("/api/v1/store", "application/json", nil)
+            }
+        """)
+        result = _run(source)
+        f = next(f for f in result["functions"] if f["name"] == "send")
+        hc = f["http_client_calls"][0]
+        assert hc["method_arg"] == "POST"
+        assert "/api/v1/store" in hc["string_args"]
+
+    def test_path_literal_extracted_from_new_request(self):
+        source = textwrap.dedent("""\
+            package main
+            import "net/http"
+            func callService(baseURL string) {
+                http.NewRequest("GET", baseURL + "/api/v1/verify", nil)
+            }
+        """)
+        result = _run(source)
+        f = next(f for f in result["functions"] if f["name"] == "callService")
+        # baseURL is not a literal so won't appear, but "/api/v1/verify" is
+        hc = f["http_client_calls"][0]
+        # The binary expression is not a literal — string_args won't include baseURL
+        # but the method arg is still captured
+        assert hc["method_arg"] == "GET"
+
+    def test_non_http_calls_not_detected_as_http_client(self):
+        source = textwrap.dedent("""\
+            package main
+            import "database/sql"
+            func store(db *sql.DB) {
+                db.Query("SELECT 1")
+            }
+        """)
+        result = _run(source)
+        f = next(f for f in result["functions"] if f["name"] == "store")
+        assert f["http_client_calls"] == []
+
+
+# ---- client library call detection ----
+
+class TestClientLibCallDetection:
+
+    SOURCE = textwrap.dedent("""\
+        package main
+
+        func EnrollHandler() {
+            mcbsClient.StoreTemplate(ctx, req)
+            identityClient.Verify(ctx, id)
+            helper()
+        }
+    """)
+
+    def test_client_lib_calls_detected(self):
+        result = _run(self.SOURCE)
+        f = next(f for f in result["functions"] if f["name"] == "EnrollHandler")
+        cl_methods = {c["method"] for c in f["client_lib_calls"]}
+        assert "StoreTemplate" in cl_methods
+        assert "Verify" in cl_methods
+
+    def test_client_lib_receivers_captured(self):
+        result = _run(self.SOURCE)
+        f = next(f for f in result["functions"] if f["name"] == "EnrollHandler")
+        receivers = {c["receiver"] for c in f["client_lib_calls"]}
+        assert "mcbsClient" in receivers
+        assert "identityClient" in receivers
+
+    def test_plain_helper_call_in_calls_not_client_lib(self):
+        result = _run(self.SOURCE)
+        f = next(f for f in result["functions"] if f["name"] == "EnrollHandler")
+        assert "helper" in f["calls"]
+        cl_methods = {c["method"] for c in f["client_lib_calls"]}
+        assert "helper" not in cl_methods
+
+    def test_client_lib_string_args_extracted(self):
+        source = textwrap.dedent("""\
+            package main
+            func call() {
+                mcbsClient.Store(ctx, "enrollment-svc", "/api/v1/store")
+            }
+        """)
+        result = _run(source)
+        f = next(f for f in result["functions"] if f["name"] == "call")
+        cl = f["client_lib_calls"][0]
+        assert "enrollment-svc" in cl["string_args"]
+        assert "/api/v1/store" in cl["string_args"]
+
+    def test_http_client_not_classified_as_client_lib(self):
+        source = textwrap.dedent("""\
+            package main
+            import "net/http"
+            func send() {
+                http.NewRequest("POST", "/api/v1/enroll", nil)
+            }
+        """)
+        result = _run(source)
+        f = next(f for f in result["functions"] if f["name"] == "send")
+        assert f["client_lib_calls"] == []
+        assert len(f["http_client_calls"]) == 1
+
+
+# ---- call graph edges ----
+
+class TestCallGraphEdges:
+    """Verify the 'calls' field forms the correct call graph edges."""
+
+    SOURCE = textwrap.dedent("""\
+        package main
+
+        func Handler() {
+            buildRequest()
+            validateInput()
+        }
+
+        func buildRequest() {
+            sendHTTP()
+        }
+
+        func sendHTTP() {}
+    """)
+
+    def test_handler_calls_captured(self):
+        result = _run(self.SOURCE)
+        h = next(f for f in result["functions"] if f["name"] == "Handler")
+        assert "buildRequest" in h["calls"]
+        assert "validateInput" in h["calls"]
+
+    def test_build_request_calls_captured(self):
+        result = _run(self.SOURCE)
+        b = next(f for f in result["functions"] if f["name"] == "buildRequest")
+        assert "sendHTTP" in b["calls"]
+
+    def test_calls_does_not_include_http_client_calls(self):
+        source = textwrap.dedent("""\
+            package main
+            import "net/http"
+            func send() {
+                http.NewRequest("POST", "/api/v1/store", nil)
+            }
+        """)
+        result = _run(source)
+        f = next(f for f in result["functions"] if f["name"] == "send")
+        # http.NewRequest should be in http_client_calls, not also in calls
+        assert "http.NewRequest" not in f["calls"]
+        assert len(f["http_client_calls"]) == 1

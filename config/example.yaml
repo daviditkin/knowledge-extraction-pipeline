@@ -1,0 +1,211 @@
+# Knowledge Extraction Pipeline — Example Configuration
+# Copy this file to config/config.yaml and edit with your actual settings.
+# All paths can be absolute or relative to the project root.
+
+# =============================================================================
+# DATABASE
+# PostgreSQL connection settings. The kep schema will be created in this database.
+# Recommendation: use the same database instance as your application,
+# but you can use a separate database if preferred.
+# =============================================================================
+database:
+  host: localhost
+  port: 5432
+  database: your_application_db
+  user: pipeline_user
+  password: changeme              # Or use ${KEP_DB_PASSWORD} env var
+  schema: kep                     # All pipeline tables use this schema
+  pool_min: 2                     # Minimum connection pool size
+  pool_max: 10                    # Maximum connection pool size
+
+# =============================================================================
+# EMBEDDING MODEL
+# The sentence-transformers model used for semantic search.
+# Download with: python scripts/download_models.py
+# This must be an absolute path or relative to the project root.
+# =============================================================================
+embedding:
+  model_path: ./models/all-MiniLM-L6-v2
+  batch_size: 32                  # Chunks per embedding batch (reduce if OOM)
+  device: cpu                     # 'cpu' or 'cuda' (use cpu unless GPU available)
+  normalize_embeddings: true      # Normalize to unit vectors (required for cosine similarity)
+
+# =============================================================================
+# EXTRACTION OUTPUT
+# Where extracted JSON files are written. This directory is git-ignored.
+# =============================================================================
+extracted_dir: ./extracted
+
+# =============================================================================
+# GO SERVICES EXTRACTOR
+# Configuration for parsing Go microservice source code.
+# =============================================================================
+go_services:
+  source_dir: /path/to/your/services   # Root directory containing all Go services
+  include_patterns:
+    - "**/*.go"
+  exclude_patterns:
+    - "**/vendor/**"           # Exclude vendored dependencies
+    - "**/*_test.go"           # Exclude test files
+    - "**/testdata/**"         # Exclude test fixtures
+    - "**/mock_*.go"           # Exclude generated mock files
+    - "**/*.pb.go"             # Exclude generated protobuf code (optional)
+  # The prefix for internal service imports. Used to detect service-to-service calls.
+  # Example: if services have imports like 'company.com/services/enrollment-svc/client',
+  # set this to 'company.com/services/'.
+  internal_module_prefix: "company.com/services/"
+  # Path to the compiled Go AST helper binary.
+  # Compiled by: cd extractors/go-service/ast_helper && go build -o ../../../bin/ast_helper .
+  ast_helper_binary: ./bin/ast_helper
+  # HTTP router type to use for handler detection (helps with ambiguous patterns)
+  # Options: auto, gorilla_mux, chi, gin, stdlib
+  # 'auto' detects based on imports
+  http_router: auto
+
+# =============================================================================
+# JAVA SERVICES EXTRACTOR
+# Configuration for parsing Java Spring Boot service source code.
+# =============================================================================
+java_services:
+  source_dir: /path/to/java-services   # Root directory containing Java services
+  include_patterns:
+    - "**/*.java"
+  exclude_patterns:
+    - "**/src/test/**"
+    - "**/*Test.java"
+    - "**/*IT.java"              # Integration test classes
+    - "**/generated/**"          # Generated source code
+  # Base URL patterns for internal services. Used to detect RestTemplate/WebClient calls.
+  # If a URL matches a pattern, the service name is extracted.
+  internal_service_url_patterns:
+    - "http://{service-name}.internal/"
+    - "http://{service-name}.svc.cluster.local/"
+
+# =============================================================================
+# FLYWAY SCHEMA EXTRACTOR
+# Configuration for reconstructing the database schema from Flyway migration files.
+# =============================================================================
+flyway:
+  # Single directory (most common):
+  migrations_dir: /path/to/flyway/migrations
+  # Or multiple directories (if migrations are spread across repos):
+  # migrations_dirs:
+  #   - /services/shared-db/migrations
+  #   - /services/identity-svc/migrations
+  sql_dialect: postgres          # SQL dialect for sqlglot parser
+
+# =============================================================================
+# CONFLUENCE EXTRACTOR
+# Configuration for extracting Confluence documentation.
+# =============================================================================
+confluence:
+  # Choose input mode:
+  # 'xml_export' — parse entities.xml from a Confluence space XML export (recommended)
+  # 'rest_api_dump' — parse JSON files from the Confluence REST API
+  input_mode: xml_export
+  export_dir: /path/to/confluence-export/
+  # Service name detection: how to associate pages with services
+  # The extractor uses a combination of these methods automatically.
+  # Set minimum_content_mentions to adjust the content-scan threshold.
+  minimum_content_mentions: 3     # Minimum times a service name must appear in first 500 words
+
+# =============================================================================
+# IXM SPEC EXTRACTOR
+# Configuration for parsing the IXM (Identity Exchange Message) XML spec.
+# =============================================================================
+ixm_spec:
+  spec_dir: /path/to/ixm-spec/
+  # Format detection: 'auto' checks for xs:schema namespace
+  # 'xsd' forces XSD parsing; 'custom' uses custom_xpath settings
+  format: auto
+  # Only needed if format: custom
+  # custom_xpath:
+  #   message_types: "//MessageType"
+  #   message_name_attr: "@name"
+  #   message_direction_attr: "@direction"
+  #   fields: "Fields/Field"
+  #   field_name_attr: "@name"
+  #   field_type_attr: "@type"
+  #   field_required_attr: "@required"
+  #   validation_pattern: "ValidationRule/@pattern"
+  #   allowed_values: "AllowedValues/Value"
+  #   description: "Description/text()"
+
+# =============================================================================
+# LOG PATTERNS EXTRACTOR
+# Scans source files for OTEL/SLF4J log calls.
+# Uses the same source directories as go_services and java_services.
+# =============================================================================
+log_patterns:
+  # No additional source_dir settings needed — uses go_services.source_dir
+  # and java_services.source_dir automatically.
+  # Additional exclusions beyond the main extractor exclusions:
+  extra_exclude_patterns: []
+
+# =============================================================================
+# RAG QUERY ENGINE
+# Settings for the retrieval and context assembly pipeline.
+# =============================================================================
+rag:
+  # Maximum tokens to include in the assembled context package.
+  # This context is passed to the prompt builder, which may trim further.
+  token_budget: 6000
+  # Number of results to retrieve from each search strategy
+  vector_k: 20
+  keyword_k: 20
+  # RRF (Reciprocal Rank Fusion) smoothing constant
+  rrf_k: 60
+  # Drop vector search results below this similarity score (0.0–1.0)
+  min_vector_score: 0.3
+  # In-memory cache settings
+  cache_size: 50                  # Number of query results to cache
+  cache_ttl_minutes: 10           # Cache entry lifetime
+
+# =============================================================================
+# PROMPT BUILDER
+# Settings for prompt assembly.
+# =============================================================================
+prompt_builder:
+  # Maximum tokens in the final assembled prompt
+  # Should be less than ChatGPT's context window minus desired response length
+  # For 8K context window: 8000 prompt + 2000 response = ~10000 total (GPT-3.5-turbo: 4096 max)
+  # Adjust based on which ChatGPT model the team is using
+  token_budget: 8000
+  templates_dir: ./prompt-builder/templates
+  # Directory for saved prompts (created automatically if it doesn't exist)
+  saved_prompts_dir: ./prompts/saved
+
+# =============================================================================
+# WEB UI
+# FastAPI web server settings.
+# =============================================================================
+ui:
+  host: 127.0.0.1               # Bind to localhost. Use 0.0.0.0 to allow network access.
+  port: 8080
+  reload: false                  # Set to true during development (auto-reload on code changes)
+  log_level: info               # uvicorn log level: debug, info, warning, error
+
+# =============================================================================
+# LLM INTEGRATION (OPTIONAL)
+# Integrate with a local Ollama instance for in-pipeline completions.
+# See docs/adr/004-no-llm-on-restricted-network.md for rationale.
+# =============================================================================
+llm:
+  # 'none' — prompt builder only; user copies prompt to ChatGPT manually (default)
+  # 'ollama' — call local Ollama API; requires Ollama to be installed on this machine
+  provider: none
+  ollama:
+    base_url: http://localhost:11434
+    model: llama3                 # or: mistral, codellama, phi3, llama3:8b, etc.
+    timeout_seconds: 120          # Ollama can be slow on CPU; increase if needed
+    # context_window: 8192        # Override model context window if needed
+
+# =============================================================================
+# LOGGING
+# Pipeline internal logging configuration.
+# =============================================================================
+logging:
+  level: INFO                    # DEBUG, INFO, WARNING, ERROR
+  format: json                   # json (for log aggregation) or text (for development)
+  # Log file (optional; if not set, logs to stdout)
+  # file: /var/log/knowledge-pipeline/pipeline.log

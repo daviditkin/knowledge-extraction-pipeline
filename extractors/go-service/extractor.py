@@ -146,10 +146,10 @@ class GoServiceExtractor:
 
             rel = str(go_file.relative_to(service_dir))
             file_hash_map[rel] = walker._sha256(go_file)
-            all_imports.extend(ast_result.get("imports", []))
+            all_imports.extend(ast_result.get("imports") or [])
 
             # HTTP handlers
-            for h in ast_result.get("http_handlers", []):
+            for h in ast_result.get("http_handlers") or []:
                 handlers.append(HandlerInfo(
                     name=h.get("handler_func", ""),
                     http_method=h.get("method"),
@@ -166,7 +166,7 @@ class GoServiceExtractor:
                 ))
 
             # gRPC registrations
-            for g in ast_result.get("grpc_registrations", []):
+            for g in ast_result.get("grpc_registrations") or []:
                 handlers.append(HandlerInfo(
                     name=g.get("service_name", ""),
                     http_method=None,
@@ -183,7 +183,7 @@ class GoServiceExtractor:
                 ))
 
             # Log calls
-            for lc in ast_result.get("log_calls", []):
+            for lc in ast_result.get("log_calls") or []:
                 level, message, fields = self._parse_log_call(lc)
                 log_events.append(LogEvent(
                     level=level,
@@ -194,7 +194,7 @@ class GoServiceExtractor:
                 ))
 
             # DB calls
-            for dc in ast_result.get("db_calls", []):
+            for dc in ast_result.get("db_calls") or []:
                 args = dc.get("args", [])
                 if args:
                     sql = self._strip_quotes(args[0])

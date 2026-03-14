@@ -97,7 +97,14 @@ func main() {
 
 func extract(fset *token.FileSet, f *ast.File) FileResult {
 	result := FileResult{
-		Package: f.Name.Name,
+		Package:           f.Name.Name,
+		Imports:           []string{},
+		Functions:         []FunctionInfo{},
+		HTTPHandlers:      []HTTPHandler{},
+		GRPCRegistrations: []GRPCRegistration{},
+		StructTypes:       []StructType{},
+		LogCalls:          []LogCall{},
+		DBCalls:           []DBCall{},
 	}
 
 	// Imports
